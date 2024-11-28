@@ -1,0 +1,159 @@
+Credoscore data:
+-----------------
+
+create table prj-prod-dataplatform.worktable_data_analysis.credo_score_July2023_Nov2024 as
+select  distinct customerId,user_id,tsaOnboardingDateTime,credolab_ReferenceNumber,deviceType,
+digitalLoanAccountId,case when loan_type in ('Flex-up','Reloan') then 'Repeat Applicant' 
+when First_application=1 and customer_id_first_applicant is not null then 'New Applicant'
+when accept_cust_id is null then  'Prev_Rejected_Reapply'
+when rn=1 then 'New Applicant' 
+--when Reject_application_count=1 then 'New Applicant' 
+when accept_application_count>1 and accept_cust_id is not null then  'Repeat Applicant'
+
+else 'Repeat Applicant' 
+end as applicant_type,loan_type,loan_sub_type,sil_product,application_Submission_DateTime,datetime(credolab_enquiry_date,'Asia/Manila') credolab_enquiry_date,
+date_diff(date(credolab_enquiry_date),date(application_Submission_DateTime), DAY) as Days_diff_loan_applied_credo_enquiry,
+fraudScore,credolabScore,decision,applicationStatus,disbursementFlag,flg_mature_fpd10,flg_mature_fpd30,
+flg_mature_fspd_30,flg_mature_fstpd_30,deffpd10,deffpd30,deffspd30,deffstpd30
+
+from (with deliquency as
+(select loanAccountNumber,
+case when obs_min_inst_def10 >=1 and min_inst_def10 =1 then 1 else 0 end deffpd10,
+case when obs_min_inst_def30 >=1 and min_inst_def30 =1 then 1 else 0 end deffpd30,
+case when obs_min_inst_def30 >=2 and min_inst_def30  in (1,2) then 1 else 0 end deffspd30,
+case when obs_min_inst_def30 >=3 and min_inst_def30 in (1,2,3) then 1 else 0 end deffstpd30,
+case when obs_min_inst_def10 >=1 then 1 else 0 end flg_mature_fpd10,
+case when obs_min_inst_def30 >=1 then 1 else 0 end flg_mature_fpd30,
+case when obs_min_inst_def30 >=2 then 1 else 0 end flg_mature_fspd_30,
+case when obs_min_inst_def30 >=3 then 1 else 0 end flg_mature_fstpd_30
+from prj-prod-dataplatform.risk_credit_mis.loan_deliquency_data),
+
+credolab_creation as (select --min(A.created_dt),min(B.createdOn)
+digitalLoanAccountId,credolabRefNumber,A.userId,loanDigitalAppliedDateAndTime,A.created_dt,B.createdOn,A.clCreditScore,B.creditScore 
+from `dl_loans_db_raw.tdbk_digital_loan_application` A
+join dl_loans_db_raw.tdbk_credolab_track B on refno=credolabRefNumber qualify row_number() over(partition by credolabRefNumber,digitalLoanAccountId order by createdOn desc )=1),
+
+accept_application_cnt as (select customerId,count(*) as accept_application_count
+from risk_credit_mis.loan_master_table loan where loan.new_loan_type in ('Flex-up','SIL-Instore','SIL-Online(discontinued)','Quick','SIL ZERO','ACL Patner 711')
+  and (flagApproval = 1 or flagRejection = 1 or loan.new_loan_type in ('Flex-up')) and coalesce(loan.termsAndConditionsSubmitDateTime,if (loan.new_loan_type ='Flex-up',loan.startApplyDateTime,loan.termsAndConditionsSubmitDateTime))  is not null and applicationStatus in ('ACTIVATED','COMPLETED','APPROVED',
+'INPROGRESS','SIGNEDDOCCOMPLETED','ACCEPT') group by 1 order by customerId),
+
+
+applciant_type_first as (select customerId customer_id_first_applicant,count(*) First_application from `prj-prod-dataplatform.risk_credit_mis.loan_master_table` 
+where new_loan_type in ('Flex-up','SIL-Instore','SIL-Online(discontinued)','Quick','SIL ZERO','ACL Patner 711')
+  and (flagApproval = 1 or flagRejection = 1 or new_loan_type in ('Flex-up')) and coalesce(termsAndConditionsSubmitDateTime,if (new_loan_type ='Flex-up',startApplyDateTime,termsAndConditionsSubmitDateTime))  is not null group by 1 having count(*)=1),
+
+previous_loan_product as (select loan.customerId,
+    case when loan.new_loan_type ='Flex-up' and reloan_flag=1 then 'Reloan'
+    when loan.new_loan_type ='Flex-up' and reloan_flag=0 then 'Flex-up'
+     WHEN loan.new_loan_type ='Flex' then 'Flex'
+    when loan.new_loan_type ='Quick'  then 'Quick'
+    when loan.new_loan_type ='Flex-up' and reloan_flag=0 then 'Flex-up'
+    when loan.new_loan_type in ('SIL-Instore','SIL-Online(discontinued)') then 'SIL'
+	when loan.new_loan_type in ('SIL ZERO') then 'SIL ZERO'
+	when loan.new_loan_type in ('ACL Patner 711') then '711'
+    end as prev_new_loan_type,loan.loanType prev_loan_type,prev_loan.previous_loan_acct,prev_loan.loanAccountNumber,loan.startApplyDateTime from `risk_credit_mis.loan_master_table` loan
+join
+(select * from (select customerId, digitalLoanAccountId,loanAccountNumber,new_loan_type,startApplyDateTime, lead(loanAccountNumber)
+ OVER(PARTITION BY customerId order by startApplyDateTime desc) as previous_loan_acct from `risk_credit_mis.loan_master_table`
+ where applicationStatus in ('COMPLETED','ACTIVATED')  order by customerId) where --previous_loan_acct is not null and 
+ new_loan_type='Flex-up')prev_loan on loan.loanAccountNumber=prev_loan.previous_loan_acct)
+  
+  select
+  loan.customerId,
+  cust.user_id,
+  tsa_onboarding_time as tsaOnboardingDateTime,
+  credolab_creation.credolabRefNumber as credolab_ReferenceNumber,
+  deviceType,
+  loan.digitalLoanAccountId,
+  --case when applciant_type_first.disbursed_loan >1 then 'Repeat Applicant' else 'New Applicant' end as applicant_type,
+
+    case when loan.new_loan_type ='Flex-up' and reloan_flag=1 then 'Reloan'
+    when loan.new_loan_type ='Flex-up' and reloan_flag=0 then 'Flex-up'
+    when loan.new_loan_type ='Quick'  then 'Quick'
+    when loan.new_loan_type ='Flex-up' and reloan_flag=0 then 'Flex-up'
+    when loan.new_loan_type in ('SIL-Instore','SIL-Online(discontinued)') then 'SIL'
+	when loan.new_loan_type in ('SIL ZERO') then 'SIL ZERO'
+    when loan.new_loan_type in ('ACL Patner 711') then '711'
+    end as loan_type,
+    case when loan.new_loan_type ='Flex-up' and reloan_flag=1 then coalesce('Reloan_'||prev_new_loan_type)
+    when loan.new_loan_type ='Flex-up' and reloan_flag=0 then coalesce('Flex-up_'||prev_new_loan_type)
+    else loan.new_loan_type end loan_sub_type,
+    
+    --new_loan_type as sub_loan_type,reloan_flag,
+    --prev_new_loan_type, 
+    case when loan.loantype='BNPL' and store_type =1 then 'Appliance'
+    when loan.loantype='BNPL' and store_type =2 then 'Mobile' 
+    when loan.loantype='BNPL' and store_type =3 then 'Mall' 
+    when loan.loantype='BNPL' and store_type not in (1,2,3) then store_tagging
+    else 'not applicable' end as sil_product,
+    coalesce(loan.termsAndConditionsSubmitDateTime,if (loan.new_loan_type ='Flex-up',loan.startApplyDateTime,loan.termsAndConditionsSubmitDateTime)) application_Submission_DateTime,
+    fraudScore,credolabScore,
+      case
+      when flagApproval = 1 then 'approved'
+      when flagRejection = 1 then 'rejected'
+      else 'auto-approved without model'
+    end as decision,
+    applicationStatus,
+    flagDisbursement as disbursementFlag,flg_mature_fpd10,flg_mature_fpd30,flg_mature_fspd_30,flg_mature_fstpd_30,
+    -- IF(Date_diff(current_date(),date(disbursementDateTime), DAY) >= 40, 1 ,0) as flg_mature_fpd10,
+    -- IF(Date_diff(current_date(),date(disbursementDateTime), DAY) >= 60, 1 ,0) as flg_mature_fpd30,
+    -- IF(Date_diff(current_date(),date(disbursementDateTime), DAY) >= 90, 1 ,0) as flg_mature_fspd_30,
+    -- IF(Date_diff(current_date(),date(disbursementDateTime), DAY) >= 120, 1 ,0) as flg_mature_fstpd_30,
+    
+    deliquency.deffpd10,deliquency.deffpd30,deliquency.deffspd30,deliquency.deffstpd30,row_number() over (partition by loan.customerId order by coalesce(termsAndConditionsSubmitDateTime,if (new_loan_type ='Flex-up',loan.startApplyDateTime,termsAndConditionsSubmitDateTime))) rn,accept_application_count,accept_application_cnt.customerId accept_cust_id,First_application,customer_id_first_applicant,credolab_creation.createdOn credolab_enquiry_date
+
+   
+  from prj-prod-dataplatform.risk_credit_mis.loan_master_table loan
+  left join(SELECT DISTINCT mer_refferal_code, mer_name mer_name,store_type,store_tagging FROM `dl_loans_db_raw.tdbk_merchant_refferal_mtb`
+  left join worktable_datachampions.TARGET_SPLIT P on P.STORE_NAME = mer_name
+ qualify row_number() over(partition by mer_refferal_code order by  created_dt desc)=1) sil_category on purpleKey=sil_category.mer_refferal_code
+  left join deliquency on deliquency.loanAccountNumber=loan.loanAccountNumber
+  left join previous_loan_product on previous_loan_product.loanAccountNumber=loan.loanAccountNumber
+  left join applciant_type_first on applciant_type_first.customer_id_first_applicant=loan.customerId
+  left join dl_customers_db_raw.tdbk_customer_mtb cust on cust.cust_id=cast(loan.customerId as string)
+  left join accept_application_cnt on accept_application_cnt.customerId=loan.customerId
+  left join credolab_creation on credolab_creation.digitalLoanAccountId=loan.digitalLoanAccountId
+  where loan.new_loan_type in ('Flex-up','SIL-Instore','SIL-Online(discontinued)','Quick','SIL ZERO','ACL Patner 711')
+  and (flagApproval = 1 or flagRejection = 1 or loan.new_loan_type in ('Flex-up')) and coalesce(loan.termsAndConditionsSubmitDateTime,if (loan.new_loan_type ='Flex-up',loan.startApplyDateTime,loan.termsAndConditionsSubmitDateTime))  is not null) final where loan_sub_type is not null and disbursementFlag =1 and 
+  date(application_Submission_DateTime) between '2023-07-01' and '2024-11-27' and
+  decision  in ('approved','auto-approved without model')
+---------------------------------------------------------------------------------------------------
+
+create or replace table `prj-prod-dataplatform.worktable_data_analysis.credo_app_package_july2023_nov2024` as 
+with 
+credolab_creation as (select --min(A.created_dt),min(B.createdOn)
+digitalLoanAccountId,credolabRefNumber,A.userId,loanDigitalAppliedDateAndTime,A.created_dt,B.createdOn,A.clCreditScore,B.creditScore 
+from `dl_loans_db_raw.tdbk_digital_loan_application` A
+join dl_loans_db_raw.tdbk_credolab_track B on refno=credolabRefNumber qualify row_number() over(partition by credolabRefNumber,digitalLoanAccountId order by createdOn desc )=1)
+
+select --app.*,track.userId,
+distinct 
+loan.customerId,loan.digitalLoanAccountId,loan.loanAccountNumber,
+app.package_name,app.first_install_time,app.last_update_time,app.version_name,
+app.deviceId,app.flags application_flags,credo.credolabRefNumber,
+ case when  new_loan_type='Flex-up' and reloan_flag=1 then 'Reloan'
+when new_loan_type='Flex-up' and reloan_flag<>1 then 'Flex-up'
+else new_loan_type end as new_loan_type,
+from  (SELECT deviceId,A.package_name,A.first_install_time,A.last_update_time,A.version_name,A.flags FROM `prj-prod-dataplatform.credolab_raw.android_credolab_Application`,
+unnest(Application) A) app
+
+--join dl_loans_db_raw.tdbk_credolab_track track on app.deviceId=track.refno
+join credolab_creation credo on credo.credolabRefNumber=app.deviceId
+join `prj-prod-dataplatform.risk_credit_mis.loan_master_table` loan
+on credo.digitalLoanAccountId=loan.digitalLoanAccountId
+where coalesce(loan.termsAndConditionsSubmitDateTime,if (loan.new_loan_type ='Flex-up',loan.startApplyDateTime,loan.termsAndConditionsSubmitDateTime)) between 
+'2023-07-01' and '2024-11-27' and loan.loanAccountNumber is not null
+
+
+---------------------------------------------------------------------
+July 2023 to June 2024:
+-------------------------
+create table worktable_data_analysis.credolab_app_package_details_Quick as select * from worktable_data_analysis.credo_app_package_july2023_nov2024
+where new_loan_type='Quick';
+
+create table worktable_data_analysis.credolab_app_package_details_Flexup as select * from worktable_data_analysis.credo_app_package_july2023_nov2024
+where new_loan_type='Flex-up';
+
+create table worktable_data_analysis.credolab_app_package_details_Sil as select * from worktable_data_analysis.credo_app_package_july2023_nov2024
+where new_loan_type='SIL-Instore';  
